@@ -11,6 +11,7 @@ import logging
 import os
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -24,6 +25,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("bvs-mcp")
 
+
+def _build_transport_security() -> TransportSecuritySettings:
+    """Configure DNS-rebinding protection for the Streamable HTTP transport.
+
+    The MCP Python SDK rejects requests whose Host/Origin headers are not in
+    an allow-list (returns 421 "Invalid Host header"). Behind Railway (or any
+    reverse proxy) the incoming Host is the public domain, which must be
+    whitelisted explicitly. Extra hosts can be supplied via
+    MCP_ALLOWED_HOSTS / MCP_ALLOWED_ORIGINS (comma-separated).
+    """
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    defaults_hosts = ["localhost:*", "127.0.0.1:*"]
+    defaults_origins = ["http://localhost:*", "http://127.0.0.1:*"]
+    if railway_domain:
+        defaults_hosts.append(f"{railway_domain}:*")
+        defaults_hosts.append(railway_domain)
+        defaults_origins.append(f"https://{railway_domain}")
+
+    extra_hosts = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    extra_origins = [o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=defaults_hosts + extra_hosts,
+        allowed_origins=defaults_origins + extra_origins,
+    )
+
+
 mcp = FastMCP(
     name="bvs-mcp",
     instructions=(
@@ -31,6 +60,7 @@ mcp = FastMCP(
         "databases — LILACS, MEDLINE, IBECS, BDENF — via the public iAHx API. "
         "Results include title, authors, journal, abstract and a stable BVS link."
     ),
+    transport_security=_build_transport_security(),
 )
 
 
@@ -181,6 +211,18 @@ async def health(_request: Request) -> JSONResponse:
 app = mcp.streamable_http_app()
 app.router.routes.append(Route("/health", health, methods=["GET"]))
 
+# Browser-based MCP clients (e.g. claude.ai web) need permissive CORS with the
+# MCP session header exposed so they can resume the session across requests.
+from starlette.middleware.cors import CORSMiddleware  # noqa: E402
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["mcp-session-id", "mcp-protocol-version"],
+)
+
 
 TOOLS = ["search_bvs", "get_article_details", "search_by_author", "search_by_subject"]
 PORT = int(os.environ.get("PORT", "8080"))
@@ -193,4 +235,11 @@ log.info("Tools:        %s", ", ".join(TOOLS))
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
