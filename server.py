@@ -71,14 +71,32 @@ def _truncate(text: str, limit: int = 400) -> str:
     return text[:limit].rstrip() + "…"
 
 
-def _format_results(results: list[dict], num_found: int, header: str) -> str:
+def _format_query_block(params: dict[str, str]) -> str:
+    """Human-readable summary of the exact Solr query the server will hit."""
+    url = bvs_client.preview_url(params)
+    lines = ["**Query**"]
+    for key in ("q", "fq", "filter", "lang", "count", "start", "output"):
+        if key in params:
+            lines.append(f"- `{key}` = `{params[key]}`")
+    lines.append(f"- URL: {url}")
+    return "\n".join(lines)
+
+
+def _format_results(
+    results: list[dict],
+    num_found: int,
+    header: str,
+    params: dict[str, str] | None = None,
+) -> str:
+    prefix = _format_query_block(params) + "\n\n---\n\n" if params else ""
     if not results:
         return (
-            f"**{header}**\n\nNo results found. "
+            prefix
+            + f"**{header}**\n\nNo results found. "
             "Try broader terms, a different database, or search_field='tw'."
         )
     lines = [
-        f"# {header}",
+        prefix + f"# {header}",
         f"_Showing {len(results)} of {num_found} match(es)._\n",
     ]
     for i, r in enumerate(results, 1):
@@ -112,6 +130,8 @@ async def search_bvs(
     limit: int = 10,
     search_field: str = "tw",
     offset: int = 0,
+    scope: str = "advanced",
+    dry_run: bool = False,
 ) -> str:
     """Search the BVS (Biblioteca Virtual em Saúde) scientific literature.
 
@@ -120,6 +140,10 @@ async def search_bvs(
     when `search_field='tw'`. For multi-database queries pass a comma list, e.g.
     `database='LILACS,MEDLINE'`.
 
+    For complex queries, prefer calling with `dry_run=True` first — the tool
+    will return the exact Solr params + URL without executing. Show that to the
+    user, confirm it's right, then re-call with `dry_run=False`.
+
     Args:
         query: Search expression.
         database: Comma-separated list, any of 'LILACS', 'MEDLINE', 'IBECS', 'BDENF'.
@@ -127,15 +151,35 @@ async def search_bvs(
         limit: Max results per page (1-100).
         search_field: 'tw' (all fields), 'ti' (title), 'au' (author), 'mh' (MeSH/DeCS).
         offset: Pagination offset (number of results to skip).
+        scope: 'advanced' (default) matches the portal's advanced search —
+               returns all Solr instances, supports multi-DB OR. 'simple'
+               reproduces the portal's simple-search box (implicit
+               `instance:lilacsplus` filter, curated subset, single DB only).
+        dry_run: If True, return the built query (params + URL) without
+                 executing the search. Default False.
     """
     try:
-        num_found, results = await bvs_client.search(
-            query, database, lang, limit, search_field, offset
+        params = bvs_client.build_params(
+            query, database, lang, limit, search_field, offset, scope
         )
     except BVSError as exc:
-        return f"**Error contacting BVS:** {exc}"
+        return f"**Error:** {exc}"
+
+    if dry_run:
+        return (
+            "**Dry run — query not executed.**\n\n"
+            + _format_query_block(params)
+            + "\n\nRe-call `search_bvs` with `dry_run=False` (or omit the param) to execute."
+        )
+
+    try:
+        num_found, results = await bvs_client.search(
+            query, database, lang, limit, search_field, offset, scope
+        )
+    except BVSError as exc:
+        return f"**Error contacting BVS:** {exc}\n\n" + _format_query_block(params)
     return _format_results(
-        results, num_found, f"BVS search: {query!r} in {database}"
+        results, num_found, f"BVS search: {query!r} in {database} ({scope})", params
     )
 
 
@@ -176,13 +220,16 @@ async def search_by_author(
 ) -> str:
     """Search BVS articles by author name (Solr field `au`)."""
     try:
+        params = bvs_client.build_params(
+            author_name, database, "pt", limit, "au"
+        )
         num_found, results = await bvs_client.search(
             author_name, database, "pt", limit, "au"
         )
     except BVSError as exc:
         return f"**Error contacting BVS:** {exc}"
     return _format_results(
-        results, num_found, f"BVS articles by author: {author_name!r}"
+        results, num_found, f"BVS articles by author: {author_name!r}", params
     )
 
 
@@ -192,13 +239,16 @@ async def search_by_subject(
 ) -> str:
     """Search BVS using MeSH/DeCS controlled-vocabulary subjects (Solr field `mh`)."""
     try:
+        params = bvs_client.build_params(
+            subject, database, "pt", limit, "mh"
+        )
         num_found, results = await bvs_client.search(
             subject, database, "pt", limit, "mh"
         )
     except BVSError as exc:
         return f"**Error contacting BVS:** {exc}"
     return _format_results(
-        results, num_found, f"BVS articles on subject: {subject!r}"
+        results, num_found, f"BVS articles on subject: {subject!r}", params
     )
 
 

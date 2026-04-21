@@ -176,29 +176,54 @@ def _friendly(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _db_filter(database: str) -> str:
-    """Translate a user-facing `database` value into a Solr filter expression.
+SCOPES = {"advanced", "simple"}
 
-    Single DB  -> 'db:LILACS'
-    Multiple   -> 'db:(LILACS OR MEDLINE)'  (comma-separated input)
-    Whitespace is trimmed. Empty segments are dropped.
+
+def _db_params(database: str, scope: str = "advanced") -> dict[str, str]:
+    """Build the DB filter query for BVS.
+
+    Two scopes map to two different portal query modes:
+
+    * `scope="advanced"` (default) — uses `fq=db:X` (Solr native). Matches the
+      portal's advanced-search URL (`where=X → fq=db:X`). Returns all instances
+      (regional, harvest, etc.). Required for multi-DB OR. Example:
+      `autism nursing` in LILACS → 87 matches.
+
+    * `scope="simple"` — uses `filter=db:X`. Reproduces the portal's simple
+      search box, which silently adds `instance:lilacsplus` (curated subset).
+      Only supports a single database. Example: `autism nursing` in LILACS
+      → 63 matches.
     """
+    if scope not in SCOPES:
+        raise BVSError(
+            f"scope must be one of {sorted(SCOPES)}, got {scope!r}"
+        )
     parts = [p.strip() for p in database.split(",") if p.strip()]
     if not parts:
         raise BVSError("database must not be empty")
+    if scope == "simple":
+        if len(parts) > 1:
+            raise BVSError(
+                "scope='simple' only supports a single database. "
+                "Use scope='advanced' for multi-database searches."
+            )
+        return {"filter": f"db:{parts[0]}"}
     if len(parts) == 1:
-        return f"db:{parts[0]}"
-    return "db:(" + " OR ".join(parts) + ")"
+        return {"fq": f"db:{parts[0]}"}
+    return {"fq": "db:(" + " OR ".join(parts) + ")"}
 
 
-async def search(
+def build_params(
     query: str,
     database: str = "LILACS",
     lang: str = "pt",
     limit: int = 10,
     search_field: str = "tw",
     offset: int = 0,
-) -> tuple[int, list[dict[str, Any]]]:
+    scope: str = "advanced",
+) -> dict[str, str]:
+    """Pure builder for the BVS request params. No network. Raises BVSError on
+    invalid input so preview and search share the same validation."""
     if not query or not query.strip():
         raise BVSError("query must not be empty")
     if search_field not in SEARCH_FIELDS:
@@ -210,18 +235,37 @@ async def search(
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
 
-    # Build a Solr-style field expression when a specific field is requested.
     q = query if search_field == "tw" else f"{search_field}:({query})"
-
     params: dict[str, str] = {
         "q": q,
-        "filter": _db_filter(database),
         "lang": lang,
         "output": "xml",
         "count": str(limit),
+        **_db_params(database, scope),
     }
     if offset:
         params["start"] = str(offset)
+    return params
+
+
+def preview_url(params: dict[str, str]) -> str:
+    """Assemble the human-readable URL that `search` would hit."""
+    import urllib.parse
+    return f"{BVS_BASE_URL}?{urllib.parse.urlencode(params)}"
+
+
+async def search(
+    query: str,
+    database: str = "LILACS",
+    lang: str = "pt",
+    limit: int = 10,
+    search_field: str = "tw",
+    offset: int = 0,
+    scope: str = "advanced",
+) -> tuple[int, list[dict[str, Any]]]:
+    params = build_params(
+        query, database, lang, limit, search_field, offset, scope
+    )
     xml_text = await _fetch_xml_text(params)
     num_found, docs = _parse_response(xml_text)
     return num_found, [_friendly(d) for d in docs]
