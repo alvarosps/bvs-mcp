@@ -4,30 +4,35 @@ The portal at pesquisa.bvsalud.org is Solr-backed and emits Solr XML
 (<response><result><doc><str name='...'>…</str><arr name='…'>…</arr></doc>…).
 We parse by the `name` attribute rather than tag name.
 
-The endpoint sits behind a Bunny Shield JS-challenge that blocks clients
-without realistic browser headers, so we always send a full browser header set.
+The endpoint sits behind a Bunny Shield anti-bot that fingerprints the TLS
+handshake (JA3). Plain `httpx`/`requests` are blocked with HTTP 403 from
+datacenter IPs, so we use `curl_cffi` which impersonates Chrome's TLS stack.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
 
-import httpx
+from curl_cffi import requests as cffi_requests
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
+from curl_cffi.requests.exceptions import Timeout as CurlTimeout
 from lxml import etree as LET
 
 BVS_BASE_URL = "https://pesquisa.bvsalud.org/portal/"
-DEFAULT_TIMEOUT = 10.0
+DEFAULT_TIMEOUT = 15.0
+IMPERSONATE = "chrome124"
 
 BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-    ),
     "Accept": "application/xml,text/xml,*/*;q=0.8",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8,es;q=0.7",
     "Referer": "https://pesquisa.bvsalud.org/portal/",
-    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 SEARCH_FIELDS = {"tw", "ti", "au", "mh"}
@@ -45,21 +50,24 @@ def _is_challenge(body: str) -> bool:
     return "bunny-shield" in head or "establishing a secure connection" in head
 
 
-async def _fetch_xml_text(params: dict[str, str]) -> str:
+def _do_request_blocking(params: dict[str, str]) -> str:
+    """curl_cffi is sync; we dispatch to a thread from the async caller."""
     try:
-        async with httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT, headers=BROWSER_HEADERS, follow_redirects=True
-        ) as client:
-            response = await client.get(BVS_BASE_URL, params=params)
-            response.raise_for_status()
-    except httpx.TimeoutException as exc:
+        response = cffi_requests.get(
+            BVS_BASE_URL,
+            params=params,
+            headers=BROWSER_HEADERS,
+            timeout=DEFAULT_TIMEOUT,
+            impersonate=IMPERSONATE,
+            allow_redirects=True,
+        )
+    except CurlTimeout as exc:
         raise BVSError(f"BVS API request timed out after {DEFAULT_TIMEOUT}s") from exc
-    except httpx.HTTPStatusError as exc:
-        raise BVSError(
-            f"BVS API returned HTTP {exc.response.status_code}"
-        ) from exc
-    except httpx.HTTPError as exc:
+    except CurlRequestException as exc:
         raise BVSError(f"BVS API unreachable: {exc}") from exc
+
+    if response.status_code >= 400:
+        raise BVSError(f"BVS API returned HTTP {response.status_code}")
 
     text = response.text
     if _is_challenge(text):
@@ -68,6 +76,10 @@ async def _fetch_xml_text(params: dict[str, str]) -> str:
             "The server IP may be blocked; retry later or contact BIREME for API access."
         )
     return text
+
+
+async def _fetch_xml_text(params: dict[str, str]) -> str:
+    return await asyncio.to_thread(_do_request_blocking, params)
 
 
 _XML_ILLEGAL_CHARS = re.compile(
