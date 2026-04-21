@@ -10,19 +10,18 @@ datacenter IPs, so we use `curl_cffi` which impersonates Chrome's TLS stack.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from typing import Any
 
-from curl_cffi import requests as cffi_requests
+from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 from curl_cffi.requests.exceptions import Timeout as CurlTimeout
 from lxml import etree as LET
 
 BVS_BASE_URL = "https://pesquisa.bvsalud.org/portal/"
-DEFAULT_TIMEOUT = 15.0
-IMPERSONATE = "chrome124"
+DEFAULT_TIMEOUT = 20.0
+IMPERSONATE = "chrome131"
 
 BROWSER_HEADERS = {
     "Accept": "application/xml,text/xml,*/*;q=0.8",
@@ -40,6 +39,11 @@ KNOWN_DATABASES = {"LILACS", "MEDLINE", "IBECS", "BDENF"}
 
 log = logging.getLogger(__name__)
 
+# Shared session for cookie persistence — Bunny Shield issues a bypass cookie
+# after the first clean TLS/header pass; keeping it across requests avoids
+# re-challenging on every call.
+_session: AsyncSession | None = None
+
 
 class BVSError(Exception):
     """Raised when the BVS API is unreachable or returns invalid data."""
@@ -50,17 +54,22 @@ def _is_challenge(body: str) -> bool:
     return "bunny-shield" in head or "establishing a secure connection" in head
 
 
-def _do_request_blocking(params: dict[str, str]) -> str:
-    """curl_cffi is sync; we dispatch to a thread from the async caller."""
-    try:
-        response = cffi_requests.get(
-            BVS_BASE_URL,
-            params=params,
+def _get_session() -> AsyncSession:
+    global _session
+    if _session is None:
+        _session = AsyncSession(
+            impersonate=IMPERSONATE,
             headers=BROWSER_HEADERS,
             timeout=DEFAULT_TIMEOUT,
-            impersonate=IMPERSONATE,
             allow_redirects=True,
         )
+    return _session
+
+
+async def _fetch_xml_text(params: dict[str, str]) -> str:
+    session = _get_session()
+    try:
+        response = await session.get(BVS_BASE_URL, params=params)
     except CurlTimeout as exc:
         raise BVSError(f"BVS API request timed out after {DEFAULT_TIMEOUT}s") from exc
     except CurlRequestException as exc:
@@ -76,10 +85,6 @@ def _do_request_blocking(params: dict[str, str]) -> str:
             "The server IP may be blocked; retry later or contact BIREME for API access."
         )
     return text
-
-
-async def _fetch_xml_text(params: dict[str, str]) -> str:
-    return await asyncio.to_thread(_do_request_blocking, params)
 
 
 _XML_ILLEGAL_CHARS = re.compile(
